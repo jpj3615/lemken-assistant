@@ -14,9 +14,15 @@ function renderContent(text: string): string {
     .replace(/>/g, "&gt;");
   return escaped
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    // Full http(s) links
     .replace(
       /(https?:\/\/[^\s<)]+)(?![^<]*>)/g,
       '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+    )
+    // Root-relative brochure links like /docs/juwel.pdf → clickable "View PDF"
+    .replace(
+      /(^|[\s(])(\/docs\/[A-Za-z0-9._-]+\.pdf)/g,
+      '$1<a href="$2" target="_blank" rel="noopener noreferrer">View PDF</a>'
     )
     .replace(/\n/g, "<br/>");
 }
@@ -123,8 +129,9 @@ export default function Home() {
             <div className="welcome">
               <h1>How can I help with your machine?</h1>
               <p>
-                Ask about products, wear parts, operating manuals, ISOBUS and
-                service — and get an answer straight away. Try one of these:
+                Ask about your Juwel, Diamant, Titan, Karat, Kristall, Heliodor,
+                Rubin, Zirkon, Solitair DT, Compact-Solitair, Thulit, rollers and
+                more. Answers link to the full brochure. Try one of these:
               </p>
               <div className="chips">
                 {SUGGESTED_QUESTIONS.map((q) => (
