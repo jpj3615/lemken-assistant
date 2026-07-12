@@ -1,5 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { SYSTEM_PROMPT } from "@/lib/knowledge";
+import { SYSTEM_PROMPT, MACHINES } from "@/lib/knowledge";
+import { createClient } from "@supabase/supabase-js";
+import OpenAI from "openai";
 
 // Run on the Node.js serverless runtime (Vercel Functions).
 export const runtime = "nodejs";
@@ -8,6 +10,79 @@ export const maxDuration = 30;
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
 const MODEL = process.env.LEMKEN_MODEL || "claude-sonnet-5";
+
+// ── RAG helpers ─────────────────────────────────────────────────────────────
+
+function detectMachine(text: string): string | null {
+  const lower = text.toLowerCase();
+  // Score each machine: check name and aliases against the user message.
+  for (const m of MACHINES) {
+    if (lower.includes(m.name.toLowerCase())) return m.id;
+    for (const alias of m.aliases) {
+      if (lower.includes(alias.toLowerCase())) return m.id;
+    }
+  }
+  return null;
+}
+
+interface ChunkRow {
+  doc_title: string;
+  page: number;
+  source_pdf: string;
+  chunk_text: string;
+  similarity: number;
+}
+
+async function retrieveChunks(
+  userMessage: string,
+  filterMachine: string | null
+): Promise<ChunkRow[]> {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SECRET_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  if (!supabaseUrl || !supabaseKey || !openaiKey) return [];
+
+  const openai = new OpenAI({ apiKey: openaiKey });
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  // Embed the user message
+  const embRes = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: userMessage,
+  });
+  const embedding = embRes.data[0].embedding;
+
+  // Call the Supabase RPC
+  const { data, error } = await supabase.rpc("match_document_chunks", {
+    query_embedding: embedding,
+    match_count: 6,
+    filter_machine: filterMachine,
+  });
+
+  if (error) {
+    console.error("match_document_chunks error:", error.message);
+    return [];
+  }
+
+  return (data as ChunkRow[]) ?? [];
+}
+
+function buildContextBlock(chunks: ChunkRow[]): string {
+  if (chunks.length === 0) return "";
+
+  const sections = chunks.map((c, i) => {
+    return `[${i + 1}] ${c.doc_title} — page ${c.page} (${c.source_pdf})\n${c.chunk_text}`;
+  });
+
+  return `<manual_context>
+The following excerpts were retrieved from LEMKEN operating/service manuals and are relevant to the customer's question. Use them to give a specific, grounded answer. Cite the document title and page number when you use information from a chunk, and link the source PDF path (e.g. ${chunks[0].source_pdf}).
+
+${sections.join("\n\n")}
+</manual_context>`;
+}
+
+// ── route handler ───────────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -50,6 +125,27 @@ export async function POST(req: Request) {
     });
   }
 
+  // ── RAG: retrieve relevant manual chunks ──────────────────────────────
+  const latestUserMsg = cleaned.filter((m) => m.role === "user").pop();
+  let contextBlock = "";
+
+  if (latestUserMsg) {
+    try {
+      const filterMachine = detectMachine(latestUserMsg.content);
+      const chunks = await retrieveChunks(latestUserMsg.content, filterMachine);
+      contextBlock = buildContextBlock(chunks);
+    } catch (err) {
+      console.error("RAG retrieval failed, falling back to brochure knowledge:", err);
+    }
+  }
+
+  // ── Build system prompt with optional RAG context ─────────────────────
+  let systemPrompt = SYSTEM_PROMPT;
+
+  if (contextBlock) {
+    systemPrompt += `\n\n## Retrieved manual context\nBelow are excerpts retrieved from LEMKEN operating and service manuals that may be relevant to the customer's current question. When these excerpts answer the question, prefer them over the general brochure summaries above — they come from the actual manuals and contain more specific information. Cite the document title and page number, and include the /docs/ PDF link so the customer can read more.\nIf the retrieved excerpts are not relevant to the question, ignore them and answer from the brochure reference above as usual.\n\n${contextBlock}`;
+  }
+
   const anthropic = new Anthropic({ apiKey });
 
   const encoder = new TextEncoder();
@@ -60,7 +156,7 @@ export async function POST(req: Request) {
         const messageStream = anthropic.messages.stream({
           model: MODEL,
           max_tokens: 1024,
-          system: SYSTEM_PROMPT,
+          system: systemPrompt,
           messages: cleaned,
         });
 
